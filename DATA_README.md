@@ -132,3 +132,27 @@ clouds, infeasible exclusions, propagated solver failures and future cutoffs.
 Cached actual/proxy dry runs at the exclusive 2026-10-30 cutoff also verified
 that current-portfolio metrics and historical return CSVs exactly match the
 previous baselines. The optimisation assumptions changed; the observations did not.
+
+## Fractional suggested allocations
+
+Plot B also connects five scenarios: 0%, 25%, 50%, 75% and 100% of the PDBC,
+JNJ, KO, CVX and AAPL weights in the **current run's expanded matched-return
+solution** (`Expanded Matched Return` in `umushroom_expanded_weights.csv`). The
+weights are taken directly from that calculated solution, not hardcoded or read
+from a possibly stale prior CSV. All existing risky holdings fund the purchases
+proportionally; GBP cash stays at its current allocation. Other external assets
+remain unheld. Every scenario is checked for full investment, long-only bounds,
+the 20% security cap and unchanged cash.
+
+`umushroom_fractional_allocations.csv` contains five rows of actual calculated
+annualised return/volatility in percent, Sharpe, cash and the five asset weights.
+The 0% row is exactly the current portfolio. The 100% row introduces all five
+suggested weights but retains the existing holdings' relative proportions; it
+is **not** the fully optimised expanded portfolio, which is marked separately.
+Fractional scenarios are not constrained to have equal estimated returns or
+monotonically improving risk/Sharpe. These are gross in-sample comparisons using
+the same GBP means, covariance and metrics as the other portfolios.
+
+Focused tests in `test_robustness.py` check exact 0% identity, all five target
+fractions, pro rata funding, fixed cash, position caps, changing target weights,
+zero targets and invalid unequal allocations.

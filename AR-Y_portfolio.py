@@ -9,6 +9,7 @@ from portfolio_validation import (run_validation, write_report, minimum_risk,
                                   feasible_cloud, exclusion_weights)
 from price_cache import load_close
 from fund_nav import load_fund_nav, ISIN as FUND_ISIN, NAME as FUND_NAME
+from robustness import proposed_weights
 
 import numpy as np
 import pandas as pd
@@ -454,6 +455,31 @@ print(f"At the current estimated return, risk falls by "
       f"{100*(metrics_current['Volatility']-base_risk):.2f} pp with existing assets; "
       f"a further {100*(base_risk-full_risk):.2f} pp with candidates.")
 
+# Scale only the five suggested positions, not the full optimised portfolio.
+# Use this run's matched-return solution rather than stale hardcoded weights.
+suggested_assets = ["PDBC", "JNJ", "KO", "CVX", "AAPL"]
+suggested_weights = full_weights[[assets.index(a) for a in suggested_assets]]
+fractional_rows = []
+for fraction in [0., .25, .50, .75, 1.]:
+    w = proposed_weights(w_current, assets, suggested_assets,
+                         float(fraction*suggested_weights.sum()),
+                         addition_weights=suggested_weights)
+    box = np.asarray(expanded_bounds)
+    if (not np.isfinite(w).all() or abs(w.sum()-1) > 1e-8 or
+            (w < box[:, 0]-1e-8).any() or (w > box[:, 1]+1e-8).any()):
+        raise RuntimeError(f"Invalid fractional allocation at {fraction:.0%}")
+    metrics = portfolio_metrics(w)
+    fractional_rows.append({"Fraction_pct": 100*fraction,
+        "Suggested_Allocation_pct": 100*fraction*suggested_weights.sum(),
+        "Cash_Weight_pct": 100*w[assets.index("CASH_GBP")],
+        "Return_pct": 100*metrics["Return"],
+        "Volatility_pct": 100*metrics["Volatility"], "Sharpe": metrics["Sharpe"],
+        **{a+"_Weight_pct": 100*w[assets.index(a)] for a in suggested_assets}})
+fractional_scenarios = pd.DataFrame(fractional_rows)
+fractional_scenarios.to_csv(OUTPUT_DIR / "umushroom_fractional_allocations.csv", index=False)
+print("\nFRACTIONAL SUGGESTED ALLOCATIONS (estimated returns are not held fixed)")
+print(fractional_scenarios.round(4).to_string(index=False))
+
 
 # ============================================================
 # 10. ONE WEIGHT COMPARISON AND STRAIGHTFORWARD ADD/REMOVE CHECKS
@@ -574,7 +600,7 @@ for name, frontier, bounds, matched_w, sharpe_w in [
         ("Existing", original_frontier, original_bounds, base_weights, w_sharpe_original),
         ("Expanded", expanded_frontier, expanded_bounds, full_weights, w_sharpe)]:
     plot_boundary(ax, frontier, bounds, name)
-    for w, marker, label in [(matched_w, "^", "optimised at current return"),
+    for w, marker, label in [(matched_w, "^", "fully optimised at current return"),
                               (sharpe_w, "D", "efficient-branch max Sharpe")]:
         ax.scatter(100*portfolio_volatility(w), 100*portfolio_return(w), marker=marker,
                    s=100, color=colors[name], edgecolor="white", zorder=8,
@@ -582,6 +608,16 @@ for name, frontier, bounds, matched_w, sharpe_w in [
 ax.scatter(100*metrics_current["Volatility"], 100*metrics_current["Return"],
            marker="*", s=240, color="#c43e3e", edgecolor="black", zorder=10,
            label="Current portfolio")
+ax.plot(fractional_scenarios.Volatility_pct, fractional_scenarios.Return_pct,
+        "o-", color="#18856b", lw=2, ms=5, zorder=9,
+        label="Fraction of five suggested allocations")
+for row in fractional_scenarios.itertuples(index=False):
+    offset = (-8, 12) if row.Fraction_pct == 100 else (5, 12 if row.Fraction_pct in [25, 75] else -14)
+    ax.annotate(f"{row.Fraction_pct:.0f}%", (row.Volatility_pct, row.Return_pct),
+                xytext=offset, textcoords="offset points", fontsize=8,
+                ha="right" if row.Fraction_pct == 100 else "left",
+                color="#12624f", bbox=dict(facecolor="white", edgecolor="none", alpha=.9, pad=1.5),
+                zorder=11)
 
 # A few reference assets only; a standalone security breaches the 20% cap.
 references = list(ranking.sort_values("Expanded_Weight_pct", ascending=False).head(3).Asset)
@@ -648,4 +684,5 @@ print("Plots: umushroom_classical_frontiers.png, umushroom_expanded_frontiers.pn
 print("Weights: umushroom_expanded_weights.csv (percentages and percentage-point changes)")
 print("Additions: umushroom_diversification_ranking.csv")
 print("Existing positions: umushroom_existing_positions.csv")
+print("Fractional scenarios: umushroom_fractional_allocations.csv")
 print(f"Summary: {OUTPUT_DIR / 'BASELINE_REPORT.md'}")

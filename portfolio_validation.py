@@ -413,6 +413,17 @@ portfolios, in percentages, and includes changes in percentage points.
 `umushroom_portfolio_comparison.csv` retains decimal return/volatility units for
 compatibility; the console shows percentage units and dimensionless Sharpe.
 
+The connected green points scale PDBC, JNJ, KO, CVX and AAPL to 0%, 25%, 50%,
+75% and 100% of **this run's** expanded matched-return weights. Each purchase
+reduces all existing risky holdings proportionally; cash stays fixed. These
+portfolios are not reoptimised and their estimated returns are allowed to change.
+100% here means the five suggested allocations, not 100% of portfolio wealth,
+and does not reproduce the separately marked fully optimised expanded portfolio.
+[Fractional scenario comparison](umushroom_fractional_allocations.csv) records
+annualised return/volatility in percentages, dimensionless Sharpe, cash and the
+five allocations. As with the frontiers, these are gross in-sample estimates,
+not cost-adjusted backtests or forecasts.
+
 ## Potential additions and existing positions
 
 `umushroom_diversification_ranking.csv` ranks each external addition by its

@@ -17,21 +17,30 @@ def return_estimate(train, method):
     return train.mean().to_numpy()*DAYS
 
 
-def proposed_weights(current, assets, additions, total_allocation, allow_held=False):
-    """Fund a sleeve pro rata from existing risky holdings, preserving cash."""
+def proposed_weights(current, assets, additions, total_allocation, allow_held=False,
+                     addition_weights=None):
+    """Fund a sleeve pro rata, splitting purchases equally unless specified."""
     w=np.array(current,dtype=float,copy=True)
     cash=assets.index('CASH_GBP')
     risky_budget=1-w[cash]
     if not additions or len(set(additions)) != len(additions):
         raise ValueError('Supply distinct investment additions')
-    if not 0 < total_allocation <= risky_budget:
+    if not 0 <= total_allocation <= risky_budget:
         raise ValueError('New allocation must fit inside the existing risky budget')
     for a in additions:
         if a not in assets or a == 'CASH_GBP' or (w[assets.index(a)] > 1e-12 and not allow_held):
             raise ValueError('Additions must be unheld investments in the universe')
-    mask=np.ones(len(w),dtype=bool);mask[cash]=False
-    w[mask]*=(risky_budget-total_allocation)/risky_budget
-    for a in additions: w[assets.index(a)]+=total_allocation/len(additions)
+    split = (np.ones(len(additions)) if addition_weights is None
+             else np.asarray(addition_weights, dtype=float))
+    if (split.shape != (len(additions),) or not np.isfinite(split).all()
+            or (split < 0).any() or (split.sum() == 0 and total_allocation > 0)):
+        raise ValueError('Addition weights must be finite, nonnegative and fund the sleeve')
+    if total_allocation > 0:
+        split = split / split.sum()
+        mask=np.ones(len(w),dtype=bool);mask[cash]=False
+        w[mask]*=(risky_budget-total_allocation)/risky_budget
+        for a, share in zip(additions, split):
+            w[assets.index(a)]+=total_allocation*share
     if not np.isclose(w.sum(),1) or np.any(w<0):
         raise RuntimeError('Invalid funded proposal')
     return w

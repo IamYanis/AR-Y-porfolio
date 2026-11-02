@@ -1,0 +1,31 @@
+# Local environments and Python caches
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local settings, credentials and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Downloaded data and source pages; retain source-review request metadata
+/data/
+/source_review/*
+!/source_review/requests.json
+
+# Generated analysis outputs; frozen trial definitions remain versioned
+/reports/
+/umushroom_*.csv
+/umushroom_*.png
+/paper_tests/*/data/
+/paper_tests/*/reports/
+
+# Accidental empty command-line output
+/--returns

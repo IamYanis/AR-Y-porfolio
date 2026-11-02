@@ -1,0 +1,23 @@
+[
+  {
+    "source": "official",
+    "url": "https://www.blackrock.com/uk/individual/products/326426/fund/1527484370694.ajax?fileType=xls&fileName=BlackRock-Euro-Government-Enhanced-Index-Fund-D-Acc-EUR_fund&dataType=fund",
+    "status": 200,
+    "bytes": 298610,
+    "retrieved_at_utc": "2026-10-30T15:04:45.884396+00:00"
+  },
+  {
+    "source": "finanzfluss",
+    "url": "https://www.finanzfluss.de/informer/fonds/ie000vydx630/",
+    "status": 200,
+    "bytes": 298423,
+    "retrieved_at_utc": "2026-10-30T15:04:47.497259+00:00"
+  },
+  {
+    "source": "morningstar",
+    "url": "https://global.morningstar.com/es/inversiones/fondos/0P0001ONS6/cotizacion",
+    "status": 403,
+    "bytes": 919,
+    "retrieved_at_utc": "2026-10-30T15:04:47.628149+00:00"
+  }
+]

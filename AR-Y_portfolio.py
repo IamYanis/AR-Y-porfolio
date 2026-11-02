@@ -4,7 +4,9 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from risk_models import shrink_covariance
-from portfolio_validation import run_validation, write_report, minimum_risk
+from portfolio_validation import (run_validation, write_report, minimum_risk,
+                                  compute_frontier, maximum_sharpe, return_limits,
+                                  feasible_cloud, exclusion_weights)
 from price_cache import load_close
 from fund_nav import load_fund_nav, ISIN as FUND_ISIN, NAME as FUND_NAME
 
@@ -13,7 +15,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
 
-from scipy.optimize import minimize, linprog
 
 # ============================================================
 # 1. SETTINGS
@@ -31,6 +32,8 @@ parser.add_argument("--as-of", default=datetime.now(ZoneInfo("Europe/London")).d
 parser.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "reports" / "latest"))
 args = parser.parse_args()
 AS_OF = pd.Timestamp(args.as_of)
+if AS_OF > pd.Timestamp(datetime.now(ZoneInfo("Europe/London")).date()):
+    raise ValueError("--as-of cannot be later than today in Europe/London")
 OUTPUT_DIR = Path(args.output_dir).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path(__file__).resolve().parent / "data" / "prices"
@@ -396,658 +399,242 @@ def portfolio_metrics(w):
 
 
 # ============================================================
-# 9. CONSTRAINTS
+# 9. CONSTRAINTS AND BOTH PORTFOLIO FRONTIERS
 # ============================================================
 
-# Max 20% for individual assets.
-# GBP cash can be between 0% and 100%.
+# Hold actual cash fixed in all investable comparisons. The 20% cap applies
+# to each security; the configured 35.31% cash holding is exempt.
+expanded_bounds = [(cash_weight/100, cash_weight/100) if a == "CASH_GBP"
+                   else (0, MAX_POSITION) for a in assets]
+original_bounds = [(0, 0) if a in candidate_assets else b
+                   for a, b in zip(assets, expanded_bounds)]
+print(f"\nOptimisation cash constraint: fixed at {cash_weight:.2f}%")
 
-expanded_bounds = [
-    (0, 1) if ticker == "CASH_GBP"
-    else (0, MAX_POSITION)
-    for ticker in assets
-]
-
-# The original universe excludes candidates
-# by fixing their weights at zero.
-
-original_bounds = [
-    (0, 0) if ticker in candidate_assets
-    else bound
-    for ticker, bound in zip(
-        assets, expanded_bounds
-    )
-]
-
-constraints_sum = {
-    "type": "eq",
-    "jac": lambda w: np.ones(n_assets),
-    "fun": lambda w: np.sum(w) - 1
-}
-
-
-# ============================================================
-# 10. GENERAL OPTIMISATION FUNCTION
-# ============================================================
-
-def solve_portfolio(
-    objective,
-    constraints,
-    bounds,
-    x0
-):
-    if objective is portfolio_variance:
-        target = -constraints[1]["fun"](np.zeros(n_assets)) if len(constraints) > 1 else None
-        return minimum_risk(cov_matrix, bounds, mu_array if target is not None else None, target)
-    result = minimize(
-        (lambda w: 100 * portfolio_variance(w))
-        if objective is portfolio_variance else objective,
-        jac=(lambda w: 200 * cov_matrix @ w)
-        if objective is portfolio_variance else None,
-        x0=x0,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-        options={
-            "maxiter": 3000,
-            "ftol": 1e-12
-        }
-    )
-
-    if not result.success:
-        raise RuntimeError(result.message)
-
-    w = result.x
-
-    if abs(np.sum(w) - 1) > 1e-5:
-        raise RuntimeError("Weights do not sum to 1")
-
-    for weight, (lower, upper) in zip(w, bounds):
-        if (
-            weight < lower - 1e-5
-            or weight > upper + 1e-5
-        ):
-            raise RuntimeError(
-                "Optimised weights violate bounds"
-            )
-
-    return w
-
-
-# ============================================================
-# 11. EFFICIENT FRONTIER FUNCTION
-# ============================================================
-
-def compute_frontier(
-    bounds,
-    n_points=N_FRONTIER_POINTS
-):
-
-    # Global minimum variance
-    w_min = solve_portfolio(
-        portfolio_variance,
-        [constraints_sum],
-        bounds,
-        w_current.copy()
-    )
-
-    # Maximum feasible estimated return
-    max_result = linprog(
-        c=-mu_array,
-        A_eq=np.ones((1, n_assets)),
-        b_eq=np.array([1.0]),
-        bounds=bounds,
-        method="highs"
-    )
-
-    if not max_result.success:
-        raise RuntimeError(
-            "Maximum return optimisation failed: "
-            + max_result.message
-        )
-
-    w_max = max_result.x
-
-    min_return = portfolio_return(w_min)
-    max_return = portfolio_return(w_max)
-
-    targets = np.linspace(
-        min_return,
-        max_return,
-        n_points
-    )
-
-    frontier_returns = []
-    frontier_vols = []
-    frontier_weights = []
-
-    for target in targets:
-
-        constraints = [
-            constraints_sum,
-            {
-                "type": "eq",
-                "jac": lambda w: mu_array,
-                "fun": lambda w, t=target:
-                    portfolio_return(w) - t
-            }
-        ]
-
-        # Feasible initial guess
-        if abs(max_return - min_return) < 1e-12:
-            initial = w_min.copy()
-        else:
-            alpha = (
-                (target - min_return)
-                / (max_return - min_return)
-            )
-
-            initial = (
-                (1 - alpha) * w_min
-                + alpha * w_max
-            )
-
-        try:
-            w = solve_portfolio(
-                portfolio_variance,
-                constraints,
-                bounds,
-                initial
-            )
-
-        except RuntimeError:
-            print(
-                f"Skipping frontier target "
-                f"{target:.2%}"
-            )
-            continue
-
-        if abs(portfolio_return(w) - target) > 1e-5:
-            continue
-
-        frontier_returns.append(
-            portfolio_return(w)
-        )
-
-        frontier_vols.append(
-            portfolio_volatility(w)
-        )
-
-        frontier_weights.append(w)
-
-    if not frontier_weights:
-        raise RuntimeError(
-            "No feasible frontier points found"
-        )
-
-    return {
-        "vols": np.array(frontier_vols),
-        "returns": np.array(frontier_returns),
-        "weights": np.array(frontier_weights),
-        "minvar_weights": w_min
-    }
-
-
-# ============================================================
-# 12. CALCULATE BOTH EFFICIENT FRONTIERS
-# ============================================================
-
-print("\nCalculating original efficient frontier...")
-
-original_frontier = compute_frontier(
-    original_bounds
-)
-
-print("\nCalculating expanded efficient frontier...")
-
-expanded_frontier = compute_frontier(
-    expanded_bounds
-)
-
-# Original frontier data
-original_vols = original_frontier["vols"]
-original_returns = original_frontier["returns"]
-
-# Expanded frontier data
-frontier_vols = expanded_frontier["vols"]
-frontier_returns = expanded_frontier["returns"]
-frontier_weights = expanded_frontier["weights"]
-
-# Minimum variance portfolios
+original_frontier = compute_frontier(cov_matrix, mu_array, original_bounds,
+                                     N_FRONTIER_POINTS)
+expanded_frontier = compute_frontier(cov_matrix, mu_array, expanded_bounds,
+                                     N_FRONTIER_POINTS)
 w_minvar_original = original_frontier["minvar_weights"]
 w_minvar_expanded = expanded_frontier["minvar_weights"]
+w_sharpe_original = maximum_sharpe(cov_matrix, mu_array, original_bounds,
+                                  original_frontier, daily_cash_return*TRADING_DAYS)
+w_sharpe = maximum_sharpe(cov_matrix, mu_array, expanded_bounds,
+                         expanded_frontier, daily_cash_return*TRADING_DAYS)
 
-# Maximum Sharpe on expanded frontier
-frontier_sharpes = np.array([
-    portfolio_sharpe(w)
-    for w in frontier_weights
-])
-
-finite_sharpes = np.where(
-    np.isfinite(frontier_sharpes),
-    frontier_sharpes,
-    -np.inf
-)
-
-if not np.any(np.isfinite(frontier_sharpes)):
-    raise RuntimeError(
-        "Cannot estimate a valid maximum Sharpe portfolio"
-    )
-
-idx_sharpe = np.argmax(finite_sharpes)
-w_sharpe = frontier_weights[idx_sharpe]
-
-
-# ============================================================
-# 13. COMPARE PORTFOLIOS
-# ============================================================
-
-metrics_current = portfolio_metrics(w_current)
-
-metrics_original_minvar = portfolio_metrics(
-    w_minvar_original
-)
-
-metrics_expanded_minvar = portfolio_metrics(
-    w_minvar_expanded
-)
-
-metrics_sharpe = portfolio_metrics(w_sharpe)
-
-comparison = pd.DataFrame({
-    "Current": metrics_current,
-    "Original Min Variance": metrics_original_minvar,
-    "Expanded Min Variance": metrics_expanded_minvar,
-    "Expanded Max Sharpe": metrics_sharpe
-})
-
-print("\nPORTFOLIO COMPARISON")
-print("=" * 65)
-
-print(comparison.round(4))
-
-
-# ============================================================
-# 14. RANDOM PORTFOLIOS + TWO SIDE-BY-SIDE PLOTS
-# ============================================================
-
-rng = np.random.default_rng(RANDOM_SEED)
-
-random_weights = rng.dirichlet(
-    np.ones(n_assets),
-    size=N_RANDOM_PORTFOLIOS
-)
-
-# Keep feasible random portfolios
-upper_bounds = np.array([
-    bound[1]
-    for bound in expanded_bounds
-])
-
-valid = np.all(
-    random_weights <= upper_bounds + 1e-10,
-    axis=1
-)
-
-random_weights = random_weights[valid]
-
-# Expected portfolio returns
-random_returns = random_weights @ mu_array
-
-# Portfolio variances
-random_variances = np.einsum(
-    "ij,jk,ik->i",
-    random_weights,
-    cov_matrix,
-    random_weights
-)
-
-random_vols = np.sqrt(
-    np.maximum(random_variances, 0.0)
-)
-
-print(
-    f"\nRandom feasible portfolios: "
-    f"{len(random_weights)}"
-)
-
-fig, axes = plt.subplots(
-    1, 2,
-    figsize=(17, 7)
-)
-
-# LEFT: decimal values
-# RIGHT: percentages
-
-for ax, scale, title in zip(
-    axes,
-    [1, 100],
-    [
-        "Expected Return vs Volatility",
-        "Expected Return (%) vs Volatility (%)"
-    ]
-):
-
-    # Possible portfolios
-    ax.scatter(
-        random_vols * scale,
-        random_returns * scale,
-        s=8,
-        alpha=0.20,
-        color="steelblue",
-        label="Possible Expanded Portfolios"
-    )
-
-    # Existing investment universe
-    ax.plot(
-        original_vols * scale,
-        original_returns * scale,
-        color="darkorange",
-        linewidth=2.5,
-        linestyle="--",
-        label="Existing Universe Frontier",
-        zorder=7
-    )
-
-    # Expanded investment universe
-    ax.plot(
-        frontier_vols * scale,
-        frontier_returns * scale,
-        color="darkblue",
-        linewidth=3,
-        label="Expanded Universe Frontier",
-        zorder=8
-    )
-
-    # Our current portfolio
-    ax.scatter(
-        metrics_current["Volatility"] * scale,
-        metrics_current["Return"] * scale,
-        color="red",
-        marker="*",
-        s=350,
-        edgecolor="black",
-        zorder=12,
-        label="Current Umushroom Portfolio"
-    )
-
-    # Original minimum variance
-    ax.scatter(
-        metrics_original_minvar["Volatility"] * scale,
-        metrics_original_minvar["Return"] * scale,
-        color="green",
-        marker="o",
-        s=120,
-        zorder=10,
-        label="Original Minimum Variance"
-    )
-
-    # Expanded minimum variance
-    ax.scatter(
-        metrics_expanded_minvar["Volatility"] * scale,
-        metrics_expanded_minvar["Return"] * scale,
-        color="limegreen",
-        marker="s",
-        s=110,
-        edgecolor="black",
-        zorder=10,
-        label="Expanded Minimum Variance"
-    )
-
-    # Maximum Sharpe
-    ax.scatter(
-        metrics_sharpe["Volatility"] * scale,
-        metrics_sharpe["Return"] * scale,
-        color="purple",
-        marker="D",
-        s=130,
-        zorder=11,
-        label="Expanded Maximum Sharpe"
-    )
-
-    # Individual investments
-    for i, ticker in enumerate(assets):
-
-        if ticker == "CASH_GBP":
-            continue
-
-        asset_vol = np.sqrt(
-            max(cov_matrix[i, i], 0)
-        )
-
-        asset_return = mu_array[i]
-
-        # New assets are displayed in purple;
-        # existing assets are grey.
-        if ticker in candidate_assets:
-            point_color = "mediumpurple"
-        else:
-            point_color = "grey"
-
-        ax.scatter(
-            asset_vol * scale,
-            asset_return * scale,
-            color=point_color,
-            s=30,
-            zorder=6
-        )
-
-        ax.annotate(
-            ticker,
-            xy=(
-                asset_vol * scale,
-                asset_return * scale
-            ),
-            xytext=(5, 5),
-            textcoords="offset points",
-            fontsize=7
-        )
-
-    if scale == 1:
-        ax.set_xlabel("Annualised Volatility")
-        ax.set_ylabel("Estimated Annual Return")
-    else:
-        ax.set_xlabel("Annualised Volatility (%)")
-        ax.set_ylabel("Estimated Annual Return (%)")
-
-    ax.set_title(title)
-    ax.grid(True, alpha=0.35)
-    ax.legend(fontsize=8, loc="best")
-
-fig.suptitle(
-    "A-Y Capital Partners — Markowitz Portfolio Optimisation\n"
-    f"Existing vs Expanded Investment Universe (GBP); bond series: {args.bond_series}",
-    fontsize=14
-)
-
-plt.tight_layout()
-
-plt.savefig(
-    OUTPUT_DIR / "umushroom_expanded_frontiers.png",
-    dpi=200,
-    bbox_inches="tight"
-)
-
-if args.no_show:
-    plt.close(fig)
-else:
-    plt.show()
-
-
-# ============================================================
-# 15. COMPARE PORTFOLIO WEIGHTS
-# ============================================================
-
-weights_table = pd.DataFrame({
-    "Asset": assets,
-    "Current": w_current * 100,
-    "Original Min Variance": w_minvar_original * 100,
-    "Expanded Min Variance": w_minvar_expanded * 100,
-    "Expanded Max Sharpe": w_sharpe * 100
-})
-
-print("\nPORTFOLIO WEIGHTS (%)")
-print("=" * 80)
-
-print(
-    weights_table.round(2).to_string(index=False)
-)
-
-weights_table.to_csv(
-    OUTPUT_DIR / "umushroom_expanded_weights.csv",
-    index=False
-)
-
-
-# ============================================================
-# 16. CANDIDATE ALLOCATIONS (NOT A DIVERSIFICATION RANKING)
-# ============================================================
-
-candidate_results = weights_table[
-    weights_table["Asset"].isin(candidate_assets)
-].copy()
-
-candidate_results = candidate_results.sort_values(
-    "Expanded Max Sharpe",
-    ascending=False
-)
-
-print("\nNEW INVESTMENT CANDIDATES")
-print("=" * 65)
-
-print(
-    candidate_results.round(2).to_string(index=False)
-)
-
-candidate_results.to_csv(
-    OUTPUT_DIR / "umushroom_candidate_allocations.csv",
-    index=False
-)
-
-
-# ============================================================
-# 17. MEASURE MINIMUM-VARIANCE IMPROVEMENT
-# ============================================================
 
 def weights_at_target(bounds, target):
-    """Minimum risk at a fixed historical return, with a feasible LP start."""
-    feasible = linprog(
-        np.zeros(n_assets),
-        A_eq=np.vstack([np.ones(n_assets), mu_array]),
-        b_eq=[1.0, target], bounds=bounds, method="highs"
-    )
-    if not feasible.success:
-        raise RuntimeError(f"Infeasible comparison return: {target:.2%}")
-    return solve_portfolio(
-        portfolio_variance,
-        [constraints_sum, {"type": "eq",
-                           "jac": lambda w: mu_array,
-                           "fun": lambda w: portfolio_return(w) - target}],
-        bounds, feasible.x
-    )
+    return minimum_risk(cov_matrix, bounds, mu_array, target)
 
-
-# Unrestricted cash makes global minimum variance trivial. Use a common
-# target grid instead, and the current portfolio's return as an anchor.
-common_low = max(original_returns.min(), frontier_returns.min())
-common_high = min(original_returns.max(), frontier_returns.max())
-common_targets = np.linspace(common_low, common_high, 30)
-matched_rows = []
-for target in common_targets:
-    wo = weights_at_target(original_bounds, target)
-    we = weights_at_target(expanded_bounds, target)
-    old_risk, new_risk = portfolio_volatility(wo), portfolio_volatility(we)
-    if new_risk > old_risk + 1e-5:
-        raise RuntimeError("Expanded universe unexpectedly increases optimal risk")
-    matched_rows.append({
-        "Target_Return": target, "Existing_Volatility": old_risk,
-        "Expanded_Volatility": new_risk,
-        "Volatility_Reduction_pp": 100 * (old_risk - new_risk)
-    })
-matched = pd.DataFrame(matched_rows)
-matched.to_csv(OUTPUT_DIR / "umushroom_matched_frontiers.csv", index=False)
 
 anchor = portfolio_return(w_current)
 base_weights = weights_at_target(original_bounds, anchor)
 full_weights = weights_at_target(expanded_bounds, anchor)
 base_risk = portfolio_volatility(base_weights)
 full_risk = portfolio_volatility(full_weights)
-pd.DataFrame([
-    {"Portfolio": label, **portfolio_metrics(w)}
-    for label,w in [("Current holdings",w_current),
-                    ("Existing universe at current return",base_weights),
-                    ("Expanded universe at current return",full_weights)]
-]).to_csv(OUTPUT_DIR / "matched_current_return.csv",index=False)
-pd.DataFrame({"Asset":assets,"Existing_Weight":base_weights,
-              "Expanded_Weight":full_weights}).to_csv(OUTPUT_DIR / "matched_current_weights.csv",index=False)
+if (full_risk > base_risk + 1e-6 or
+        portfolio_variance(w_minvar_expanded) > portfolio_variance(w_minvar_original)+1e-8):
+    raise RuntimeError("Expanded universe unexpectedly increases optimal risk")
+
+portfolios = {
+    "Current": w_current,
+    "Original Min Variance": w_minvar_original,
+    "Expanded Min Variance": w_minvar_expanded,
+    "Original Max Sharpe": w_sharpe_original,
+    "Expanded Max Sharpe": w_sharpe,
+    "Original Matched Return": base_weights,
+    "Expanded Matched Return": full_weights,
+}
+comparison = pd.DataFrame({name: portfolio_metrics(w) for name, w in portfolios.items()})
+metrics_current = portfolio_metrics(w_current)
+print("\nPORTFOLIO COMPARISON (annualised estimates; returns and volatility in %)")
+display = comparison.T.copy()
+display[["Return", "Volatility"]] *= 100
+print(display.round(4).to_string())
+print(f"At the current estimated return, risk falls by "
+      f"{100*(metrics_current['Volatility']-base_risk):.2f} pp with existing assets; "
+      f"a further {100*(base_risk-full_risk):.2f} pp with candidates.")
+
+
+# ============================================================
+# 10. ONE WEIGHT COMPARISON AND STRAIGHTFORWARD ADD/REMOVE CHECKS
+# ============================================================
+
+weights_table = pd.DataFrame({"Asset": assets,
+                              **{name: 100*w for name, w in portfolios.items()}})
+for name in portfolios:
+    if name != "Current":
+        weights_table[name + " Change_pp"] = weights_table[name]-weights_table["Current"]
+weights_table.to_csv(OUTPUT_DIR / "umushroom_expanded_weights.csv", index=False)
+
 rankings = []
 for ticker in candidate_assets:
     i = assets.index(ticker)
     add_bounds = list(original_bounds)
     add_bounds[i] = expanded_bounds[i]
     add_weights = weights_at_target(add_bounds, anchor)
-    without_bounds = list(expanded_bounds)
-    without_bounds[i] = (0, 0)
-    without_weights = weights_at_target(without_bounds, anchor)
+    without_weights = exclusion_weights(cov_matrix, mu_array, expanded_bounds, i, anchor)
+    if without_weights is None:
+        raise RuntimeError("Removing a candidate should retain the feasible existing portfolio")
+    add_risk = portfolio_volatility(add_weights)
+    if add_risk > base_risk + 1e-6:
+        raise RuntimeError(f"Adding {ticker} unexpectedly increases optimal risk")
     rankings.append({
         "Asset": ticker,
-        "Add_One_Risk_Reduction_pp": 100 * (
-            base_risk - portfolio_volatility(add_weights)),
-        "Removal_Risk_Increase_pp": 100 * (
-            portfolio_volatility(without_weights) - full_risk),
-        "Expanded_Weight_pct": 100 * full_weights[i],
+        "Add_One_Risk_Reduction_pp": 100*(base_risk-add_risk),
+        "Removal_Risk_Increase_pp": 100*(portfolio_volatility(without_weights)-full_risk),
+        "Add_One_Weight_pct": 100*add_weights[i],
+        "Expanded_Weight_pct": 100*full_weights[i],
     })
-ranking = pd.DataFrame(rankings).sort_values(
-    "Add_One_Risk_Reduction_pp", ascending=False
-)
+ranking = pd.DataFrame(rankings).sort_values("Add_One_Risk_Reduction_pp", ascending=False)
 ranking.to_csv(OUTPUT_DIR / "umushroom_diversification_ranking.csv", index=False)
-print("\nDIVERSIFICATION AT MATCHED HISTORICAL RETURN")
-print(f"Target: {anchor:.2%}; existing risk: {base_risk:.2%}; "
-      f"expanded risk: {full_risk:.2%}")
-print(ranking.round(4).to_string(index=False))
-print("In-sample estimates: validate on later data before interpreting as durable benefits.")
+
+review_rows = []
+for ticker in existing_assets:
+    if ticker == "CASH_GBP":
+        continue
+    i = assets.index(ticker)
+    row = {"Asset": ticker, "Current_Weight_pct": 100*w_current[i],
+           "Existing_Weight_pct": 100*base_weights[i],
+           "Expanded_Weight_pct": 100*full_weights[i],
+           "Existing_Change_pp": 100*(base_weights[i]-w_current[i]),
+           "Expanded_Change_pp": 100*(full_weights[i]-w_current[i]),
+           "Negligible_Existing_Weight": bool(base_weights[i] <= .001),
+           "Negligible_Expanded_Weight": bool(full_weights[i] <= .001)}
+    for label, bounds, risk in [("Existing", original_bounds, base_risk),
+                                ("Expanded", expanded_bounds, full_risk)]:
+        without = exclusion_weights(cov_matrix, mu_array, bounds, i, anchor)
+        row[label + "_Exclusion_Status"] = "infeasible at target" if without is None else "ok"
+        delta = np.nan if without is None else 100*(portfolio_volatility(without)-risk)
+        if without is not None and delta < -1e-4:
+            raise RuntimeError(f"Excluding {ticker} unexpectedly improves optimal risk")
+        row[label + "_Exclusion_Risk_Increase_pp"] = delta
+    review_rows.append(row)
+review = pd.DataFrame(review_rows).sort_values("Existing_Exclusion_Risk_Increase_pp",
+                                             ascending=False, na_position="first")
+review.to_csv(OUTPUT_DIR / "umushroom_existing_positions.csv", index=False)
+print("\nTOP ADDITIONS AT THE CURRENT ESTIMATED RETURN (in-sample only)")
+print(ranking.head(10).round(4).to_string(index=False))
+print("Negligible means at most 0.1% of portfolio value; a zero weight is not a sell recommendation.")
+
 
 # ============================================================
-# 18. SAVE FRONTIER DATA
+# 11. TWO DISTINCT VISUALISATIONS
 # ============================================================
 
-original_frontier_table = pd.DataFrame({
-    "Volatility": original_vols,
-    "Expected_Return": original_returns
-})
+colors = {"Existing": "#c16b16", "Expanded": "#193e70"}
+series_label = ("BlackRock official NAV" if args.bond_series == "actual"
+                else "EUNH.DE PROXY for the BlackRock fund")
+sample_label = (f"{series_label} · {returns.index.min().date()} to "
+                f"{returns.index.max().date()}")
 
-expanded_frontier_table = pd.DataFrame({
-    "Volatility": frontier_vols,
-    "Expected_Return": frontier_returns,
-    "Sharpe": frontier_sharpes
-})
 
-original_frontier_table.to_csv(
-    OUTPUT_DIR / "umushroom_original_frontier.csv",
-    index=False
-)
+def plot_boundary(ax, frontier, bounds, name, lower=False):
+    cloud = feasible_cloud(bounds, N_RANDOM_PORTFOLIOS, RANDOM_SEED)
+    vols = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", cloud, cov_matrix, cloud), 0))
+    ax.scatter(100*vols, 100*(cloud @ mu_array), s=3, alpha=.08,
+               color=colors[name], rasterized=True)
+    ax.plot(100*frontier["vols"], 100*frontier["returns"], lw=2.5,
+            color=colors[name], label=name + " efficient frontier")
+    if lower and len(frontier["inefficient_returns"]):
+        ax.plot(100*frontier["inefficient_vols"], 100*frontier["inefficient_returns"],
+                ":", lw=2, color=colors[name], label=name + " inefficient branch")
+    w = frontier["minvar_weights"]
+    ax.scatter(100*portfolio_volatility(w), 100*portfolio_return(w), s=85,
+               color=colors[name], edgecolor="white", zorder=6,
+               label=name + " minimum variance")
 
-expanded_frontier_table.to_csv(
-    OUTPUT_DIR / "umushroom_expanded_frontier.csv",
-    index=False
-)
 
-comparison.to_csv(
-    OUTPUT_DIR / "umushroom_portfolio_comparison.csv"
-)
+def finish_plot(fig, ax, title, note, filename):
+    ax.set(xlabel="Annualised volatility (%)", ylabel="Estimated annualised return (%)",
+           title=title)
+    ax.grid(alpha=.25)
+    ax.legend(fontsize=8, loc="best")
+    fig.text(.5, .015, note, ha="center", fontsize=8, color="#454545")
+    fig.tight_layout(rect=(0, .065, 1, 1))
+    fig.savefig(OUTPUT_DIR / filename, dpi=180, bbox_inches="tight")
+    if args.no_show:
+        plt.close(fig)
 
-print("\nANALYSIS COMPLETE")
-print("=" * 65)
 
-print("Files saved:")
-print(" - umushroom_expanded_frontiers.png")
-print(" - umushroom_expanded_weights.csv")
-print(" - umushroom_candidate_allocations.csv")
-print(" - umushroom_matched_frontiers.csv")
-print(" - umushroom_diversification_ranking.csv")
-print(" - umushroom_original_frontier.csv")
-print(" - umushroom_expanded_frontier.csv")
-print(" - umushroom_portfolio_comparison.csv")
+# A: same fitted risky covariance, zero cash, unchanged 20% security cap.
+fig, ax = plt.subplots(figsize=(12, 8))
+for name, bounds in [("Existing", original_bounds), ("Expanded", expanded_bounds)]:
+    risky_bounds = [(0, 0) if a == "CASH_GBP" else b for a, b in zip(assets, bounds)]
+    frontier = compute_frontier(cov_matrix, mu_array, risky_bounds,
+                                N_FRONTIER_POINTS, include_inefficient=True)
+    plot_boundary(ax, frontier, risky_bounds, name, lower=True)
+finish_plot(fig, ax, "A — Classical Markowitz portfolios · risky assets only (GBP)\n" + sample_label,
+            "Long-only; 20% cap per security; cash excluded. Clouds sample part of the feasible region.\n"
+            "Dotted lower boundaries are inefficient. Historical means are not forecasts.",
+            "umushroom_classical_frontiers.png")
+
+# B: retain actual cash, and mark the exact current-return optimisations.
+fig, ax = plt.subplots(figsize=(12, 8))
+for name, frontier, bounds, matched_w, sharpe_w in [
+        ("Existing", original_frontier, original_bounds, base_weights, w_sharpe_original),
+        ("Expanded", expanded_frontier, expanded_bounds, full_weights, w_sharpe)]:
+    plot_boundary(ax, frontier, bounds, name)
+    for w, marker, label in [(matched_w, "^", "optimised at current return"),
+                              (sharpe_w, "D", "efficient-branch max Sharpe")]:
+        ax.scatter(100*portfolio_volatility(w), 100*portfolio_return(w), marker=marker,
+                   s=100, color=colors[name], edgecolor="white", zorder=8,
+                   label=name + " " + label)
+ax.scatter(100*metrics_current["Volatility"], 100*metrics_current["Return"],
+           marker="*", s=240, color="#c43e3e", edgecolor="black", zorder=10,
+           label="Current portfolio")
+
+# A few reference assets only; a standalone security breaches the 20% cap.
+references = list(ranking.sort_values("Expanded_Weight_pct", ascending=False).head(3).Asset)
+for ticker in references + ["CBGA.L", FUND_ISIN]:
+    i = assets.index(ticker)
+    x, y = 100*np.sqrt(cov_matrix[i, i]), 100*mu_array[i]
+    label = ("BlackRock NAV" if args.bond_series == "actual" else "EUNH.DE proxy") if ticker == FUND_ISIN else ticker
+    ax.scatter(x, y, s=22, color="#777777", zorder=4)
+    ax.annotate(label, (x, y), xytext=(4, 4), textcoords="offset points", fontsize=7)
+finish_plot(fig, ax, f"B — Actual portfolio optimisation · GBP cash fixed at {cash_weight:.2f}%\n" + sample_label,
+            "Long-only; 20% cap per security. Triangles preserve the current estimated return.\n"
+            "Grey assets are 100% reference points, outside portfolio constraints. Estimates are not forecasts.",
+            "umushroom_expanded_frontiers.png")
+if not args.no_show:
+    plt.show()
+
+
+# ============================================================
+# 12. PRESERVE SUPPORTING CSV AND RESEARCH REPORT INTERFACES
+# ============================================================
+
+# Compare the full common feasible return range; flag dominated lower points.
+low, high = return_limits(mu_array, original_bounds)
+matched_rows = []
+for target in np.linspace(low, high, 30):
+    wo = weights_at_target(original_bounds, target)
+    we = weights_at_target(expanded_bounds, target)
+    old_risk, new_risk = portfolio_volatility(wo), portfolio_volatility(we)
+    if new_risk > old_risk + 1e-6:
+        raise RuntimeError("Expanded universe unexpectedly increases optimal risk")
+    matched_rows.append({"Target_Return": target, "Existing_Volatility": old_risk,
+                         "Expanded_Volatility": new_risk,
+                         "Volatility_Reduction_pp": 100*(old_risk-new_risk),
+                         "Existing_Branch": "efficient" if target >= portfolio_return(w_minvar_original)-1e-10 else "inefficient",
+                         "Expanded_Branch": "efficient" if target >= portfolio_return(w_minvar_expanded)-1e-10 else "inefficient"})
+matched = pd.DataFrame(matched_rows)
+matched.to_csv(OUTPUT_DIR / "umushroom_matched_frontiers.csv", index=False)
+pd.DataFrame([{"Portfolio": name, **portfolio_metrics(w)} for name, w in [
+    ("Current holdings", w_current), ("Existing universe at current return", base_weights),
+    ("Expanded universe at current return", full_weights)]]).to_csv(
+        OUTPUT_DIR / "matched_current_return.csv", index=False)
+pd.DataFrame({"Asset": assets, "Existing_Weight": base_weights,
+              "Expanded_Weight": full_weights}).to_csv(OUTPUT_DIR / "matched_current_weights.csv", index=False)
+for filename, frontier in [("umushroom_original_frontier.csv", original_frontier),
+                            ("umushroom_expanded_frontier.csv", expanded_frontier)]:
+    pd.DataFrame({"Volatility": frontier["vols"], "Expected_Return": frontier["returns"],
+                  "Sharpe": [portfolio_sharpe(w) for w in frontier["weights"]]}).to_csv(
+                      OUTPUT_DIR / filename, index=False)
+comparison.to_csv(OUTPUT_DIR / "umushroom_portfolio_comparison.csv")
+# Keep this legacy allocation-only export for downstream users.
+weights_table[weights_table.Asset.isin(candidate_assets)].sort_values(
+    "Expanded Max Sharpe", ascending=False).to_csv(
+        OUTPUT_DIR / "umushroom_candidate_allocations.csv", index=False)
 
 # Reproducible research outputs; no trades or changes to recorded holdings.
 returns.to_csv(OUTPUT_DIR / "gbp_daily_returns.csv", index_label="Date")
@@ -1056,4 +643,9 @@ if args.validate:
     validation = run_validation(returns, holdings, candidate_assets, MAX_POSITION, OUTPUT_DIR)
 write_report(OUTPUT_DIR, returns, holdings, candidate_assets, comparison, matched,
              ranking, cov, sample_cov, shrinkage, validation, args.as_of, DATA_DIR, args.bond_series)
-print(f"Report: {OUTPUT_DIR / 'BASELINE_REPORT.md'}")
+print(f"\nAnalysis complete. Outputs: {OUTPUT_DIR}")
+print("Plots: umushroom_classical_frontiers.png, umushroom_expanded_frontiers.png")
+print("Weights: umushroom_expanded_weights.csv (percentages and percentage-point changes)")
+print("Additions: umushroom_diversification_ranking.csv")
+print("Existing positions: umushroom_existing_positions.csv")
+print(f"Summary: {OUTPUT_DIR / 'BASELINE_REPORT.md'}")

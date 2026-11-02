@@ -31,6 +31,11 @@ The research runner writes the readable report to:
 
 `reports/research-latest/SUMMARY_REPORT.html`
 
+For the main script's two Markowitz plots, weight comparison, addition ranking,
+existing-position review and concise `BASELINE_REPORT.md`, see `reports/latest/`.
+The actual-portfolio optimisations retain the configured GBP cash weight;
+the separate classical chart excludes cash. Details are in [DATA_README.md](DATA_README.md).
+
 It also writes a Markdown version and supporting CSVs. Asset prices, FX rates
 and the actual fund's NAV are downloaded when missing and cached locally.
 Existing cached observations are refreshed only when explicitly requested.
@@ -66,6 +71,3 @@ They remain on the original computer. A fresh clone must obtain its own data
 and regenerate reports; current provider data may differ from the original
 research vintage. The frozen paper-test definition alone does not constitute
 observed forward performance.
-
-The candidate investment decision report requested separately is not yet
-implemented in this repository.

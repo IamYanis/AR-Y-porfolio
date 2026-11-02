@@ -87,3 +87,48 @@ sensitivity checks and generates an HTML/Markdown report:
 
 Read `RESEARCH_README.md` for report-only regeneration, dated outputs and the
 small-change comparisons. The generated report is `reports/research-latest/SUMMARY_REPORT.html`.
+
+## Markowitz views and weight optimisation
+
+The main script now produces two different charts:
+
+- `umushroom_classical_frontiers.png`: risky securities only, with zero cash,
+  feasible allocation samples, minimum-variance points, and separately styled
+  efficient and inefficient branches for both universes.
+- `umushroom_expanded_frontiers.png`: actual-portfolio comparison with GBP cash
+  fixed at the configured holding (currently 35.31%). It marks the current
+  portfolio, both minimum-variance portfolios, both efficient-branch maximum
+  Sharpes, and both minimum-volatility portfolios at the current estimated return.
+
+All optimised portfolios are long-only, fully invested, and capped at 20% per
+security. Cash is exempt from that cap. The current portfolio's weights, return
+series, annualisation and covariance treatment are unchanged. Both universes
+use the same common GBP history and the same fitted OAS estimator.
+
+`umushroom_expanded_weights.csv` contains the six optimised allocations alongside
+current weights, with percentage-point changes. `umushroom_diversification_ranking.csv`
+ranks add-one marginal volatility savings at the current estimated return and
+fixed cash. `umushroom_existing_positions.csv` evaluates exclusion of each
+existing security in both universes at that same target. Infeasible exclusions
+are labelled; numerical solver failures stop the calculation. Negligible weights
+mean at most 0.1% of total portfolio value, not an automatic sell decision.
+
+`BASELINE_REPORT.md` contains the concise comparison and embeds both plots.
+Existing supporting CSV names remain available, including decimal-unit metrics;
+the console and plots display returns and volatility as annualised percentages.
+Matched-return CSV rows now label efficient and inefficient branches separately.
+The feasible clouds illustrate sampled allocations, not the complete feasible
+region or a forecast. Maximum Sharpe is refined along the efficient branch when
+positive excess returns exist; otherwise it is the best efficient-grid point.
+
+Use a new `--output-dir` to preserve earlier research. Historical means are noisy
+in-sample estimates. The main script rejects future `--as-of` dates and excludes
+the specified date and later; cached adjusted prices are still current vintages,
+not point-in-time data. No frozen paper-test definitions or observations change.
+
+Focused tests in `test_portfolio_validation.py` cover branch separation, full
+investment and caps, nested-universe risk, analytic maximum Sharpe, fixed-cash
+clouds, infeasible exclusions, propagated solver failures and future cutoffs.
+Cached actual/proxy dry runs at the exclusive 2026-10-30 cutoff also verified
+that current-portfolio metrics and historical return CSVs exactly match the
+previous baselines. The optimisation assumptions changed; the observations did not.

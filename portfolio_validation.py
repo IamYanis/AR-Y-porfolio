@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize, linprog, LinearConstraint, Bounds
+from scipy.optimize import minimize, minimize_scalar, linprog, LinearConstraint, Bounds
 from risk_models import shrink_covariance
 
 DAYS = 252
@@ -91,6 +91,111 @@ def minimum_risk(cov, bounds, mu=None, target=None):
     w=fixed
     w[free]=result.x
     return w
+
+
+def return_limits(mu, bounds):
+    """Lowest and highest feasible arithmetic return under the same bounds."""
+    limits = []
+    for sign in (1, -1):
+        result = linprog(sign * mu, A_eq=np.ones((1, len(mu))),
+                         b_eq=[1.], bounds=bounds, method='highs')
+        if not result.success:
+            raise RuntimeError('Return-range optimisation failed: ' + result.message)
+        limits.append(float(result.x @ mu))
+    return limits
+
+
+def compute_frontier(cov, mu, bounds, n_points=150, include_inefficient=False):
+    """Minimum-risk boundary, with its dominated lower branch kept separate."""
+    if n_points < 2:
+        raise ValueError('A frontier grid requires at least two points')
+    w_min = minimum_risk(cov, bounds)
+    low, high = return_limits(mu, bounds)
+    turning_return = float(w_min @ mu)
+
+    def branch(start, stop):
+        targets = (np.array([turning_return]) if abs(stop-start) < 1e-10
+                   else np.linspace(start, stop, n_points))
+        weights = np.array([minimum_risk(cov, bounds, mu, t) for t in targets])
+        if np.max(abs(weights @ mu - targets)) > 1e-7:
+            raise RuntimeError('Frontier weights miss their return targets')
+        vols = np.sqrt(np.maximum(np.einsum('ij,jk,ik->i', weights, cov, weights), 0))
+        return weights, weights @ mu, vols
+
+    weights, means, vols = branch(turning_return, high)
+    result = dict(weights=weights, returns=means, vols=vols, minvar_weights=w_min)
+    if include_inefficient and turning_return-low > 1e-10:
+        weights, means, vols = branch(low, turning_return)
+    else:
+        weights, means, vols = np.empty((0, len(mu))), np.array([]), np.array([])
+    result.update(inefficient_weights=weights, inefficient_returns=means,
+                  inefficient_vols=vols)
+    return result
+
+
+def maximum_sharpe(cov, mu, bounds, frontier, risk_free):
+    """Select from the efficient branch and refine its best grid interval.
+
+    With positive excess returns Sharpe's upper level sets are convex, so the
+    efficient-branch maximum is unimodal. Retain grid points and endpoints too.
+    If all excess returns are nonpositive, report the best grid point only;
+    it is not necessarily the maximum Sharpe over inefficient portfolios.
+    """
+    vols = frontier['vols']
+    ratios = np.full(len(vols), -np.inf)
+    valid = vols > 1e-10
+    ratios[valid] = (frontier['returns'][valid]-risk_free) / vols[valid]
+    if not np.isfinite(ratios).any():
+        raise RuntimeError('No positive-risk portfolio has a defined Sharpe ratio')
+    best = int(np.argmax(ratios))
+    choices = [frontier['weights'][best]]
+    left, right = max(0, best-1), min(len(vols)-1, best+1)
+    low, high = frontier['returns'][[left, right]]
+
+    def negative_sharpe(target):
+        w = minimum_risk(cov, bounds, mu, target)
+        vol = np.sqrt(max(float(w @ cov @ w), 0))
+        if vol <= 1e-10:
+            return np.inf
+        return -(float(w @ mu)-risk_free) / vol
+
+    if ratios[best] > 0 and high-low > 1e-10:
+        result = minimize_scalar(negative_sharpe, bounds=(low, high),
+                                 method='bounded', options={'xatol': 1e-10})
+        if not result.success:
+            raise RuntimeError('Sharpe refinement failed: ' + result.message)
+        choices.append(minimum_risk(cov, bounds, mu, result.x))
+    return max(choices, key=lambda w: (float(w @ mu)-risk_free) /
+               np.sqrt(float(w @ cov @ w)))
+
+
+def feasible_cloud(bounds, count=100000, seed=42):
+    """Illustrative feasible allocations, not a forecast or a complete region."""
+    box = np.asarray(bounds, dtype=float)
+    free = box[:, 1]-box[:, 0] > 1e-12
+    remaining = 1-box[:, 0].sum()
+    if remaining < -1e-10 or box[:, 1].sum() < 1-1e-10:
+        raise ValueError('Infeasible cloud bounds')
+    weights = np.tile(box[:, 0], (count, 1))
+    if free.any():
+        weights[:, free] += np.random.default_rng(seed).dirichlet(
+            np.ones(free.sum()), size=count) * max(remaining, 0)
+    valid = ((abs(weights.sum(axis=1)-1) < 1e-10) &
+             (weights <= box[:, 1]+1e-10).all(axis=1))
+    return weights[valid]
+
+
+def exclusion_weights(cov, mu, bounds, asset_index, target):
+    """None denotes proven infeasibility; numerical solver failures propagate."""
+    box = list(bounds)
+    box[asset_index] = (0, 0)
+    feasible = linprog(np.zeros(len(mu)), A_eq=np.vstack([np.ones(len(mu)), mu]),
+                       b_eq=[1., target], bounds=box, method='highs')
+    if feasible.status == 2:
+        return None
+    if not feasible.success:
+        raise RuntimeError('Exclusion feasibility check failed: ' + feasible.message)
+    return minimum_risk(cov, box, mu, target)
 
 
 def hold_period(test, weights):
@@ -239,6 +344,8 @@ def write_report(output, returns, holdings, candidates, comparison, matched, ran
               'pandas':pd.__version__,'cache_files':files,'holdings_percent':holdings,
               'candidate_assets':list(candidates),'oas_shrinkage':float(shrinkage),
               'max_position':.20,'cash_yield':.03,'trading_days':252,
+              'optimisation_cash_weight':holdings['CASH_GBP']/100,
+              'negligible_weight_threshold':.001,
               'random_seed':42,'train_observations':252,'test_observations':63}
     (output/'run_manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     text=f'''# Portfolio research baseline
@@ -260,8 +367,9 @@ account reconciliation has been performed. Cash is the residual to 100%.
 
 `matched_current_return.csv` directly compares the configured portfolio with
 both optimised universes at its estimated return. `matched_current_weights.csv`
-records those allocations. These portfolios may choose different cash levels;
-rolling validation below fixes cash to isolate investment-universe effects.
+records those allocations. All baseline optimisations fix GBP cash to the
+actual allocation; the remaining {100-holdings['CASH_GBP']:.2f}% is invested with a 20% cap per
+security, long-only weights, and a total allocation of 100%.
 
 OAS shrinkage: {shrinkage:.2%}. Both universes use the same fitted covariance
 and common return sample. Cash covariance is zero by assumption, with a fixed
@@ -272,11 +380,60 @@ zero-risk cash portfolios have undefined Sharpe ratios.
 
 {markdown_table(comparison.T.round(5).reset_index().rename(columns={'index':'Portfolio'}))}
 
-Unrestricted-cash minimum variance portfolios are trivial. Matched-return
-comparisons are in `umushroom_matched_frontiers.csv`; candidate add/remove
-benefits at the current portfolio's estimated return are in
-`umushroom_diversification_ranking.csv`. These are **in-sample**, and their
-return targets depend on noisy historical means.
+At the current estimated return, optimising existing holdings reduces estimated
+volatility by {100*(comparison['Current']['Volatility']-comparison['Original Matched Return']['Volatility']):.2f}
+percentage points. Expanding the universe reduces it by a further
+{100*(comparison['Original Matched Return']['Volatility']-comparison['Expanded Matched Return']['Volatility']):.2f}
+percentage points. Both keep the same cash allocation. These are **in-sample**
+comparisons, and their return targets depend on noisy historical means.
+
+## Two portfolio views and weights
+
+![Classical risky-only portfolios](umushroom_classical_frontiers.png)
+
+Plot A excludes cash entirely and keeps the 20% security cap. Solid curves are
+efficient boundaries; dotted lower curves are inefficient. The clouds contain
+feasible sampled allocations, not the whole region, an unconstrained analytic
+bullet, or simulated future returns. Both universes use the same sample and
+the same fitted OAS covariance matrix.
+
+![Actual portfolio optimisation](umushroom_expanded_frontiers.png)
+
+Plot B fixes cash at {holdings['CASH_GBP']:.2f}%. Triangles mark minimum volatility
+at the current portfolio's estimated return. Minimum variance and maximum Sharpe
+are separate objectives: their estimated returns need not match the current
+portfolio. Grey standalone-security reference points are outside the 20% cap.
+Maximum Sharpe is selected from the efficient branch and refined between nearby
+return-grid points when excess returns are positive. If all excess returns are
+nonpositive, only the best efficient-grid Sharpe is reported; this need not be
+the maximum over dominated portfolios. Zero-risk Sharpe is undefined.
+
+`umushroom_expanded_weights.csv` compares current weights with all six optimised
+portfolios, in percentages, and includes changes in percentage points.
+`umushroom_portfolio_comparison.csv` retains decimal return/volatility units for
+compatibility; the console shows percentage units and dimensionless Sharpe.
+
+## Potential additions and existing positions
+
+`umushroom_diversification_ranking.csv` ranks each external addition by its
+marginal volatility reduction after reoptimising at the **same current estimated
+return and cash weight**. It also records allocations in the full expanded
+matched-return portfolio and the risk cost of removing that candidate.
+Add-one effects are not additive.
+
+{markdown_table(ranking.head(10).round(4))}
+
+`umushroom_existing_positions.csv` shows current and matched-return optimised
+weights, changes in percentage points, and the risk increase from excluding each
+existing security and reoptimising each universe. Positive exclusion costs mean
+the asset helps under this model; infeasible exclusions are labelled, with no
+invented numerical penalty. Cash is fixed and is not an exclusion candidate.
+Negligible means at most 0.1% of total portfolio value. A zero or negligible
+optimal weight is not proof of a bad investment and is not a sell instruction.
+
+`umushroom_matched_frontiers.csv` retains the comparison across the full common
+feasible return range and explicitly labels each efficient/inefficient branch.
+The original legacy frontier and allocation exports remain available.
 
 ## Historical validation
 
